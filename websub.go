@@ -1,17 +1,17 @@
 // This file is part of Gopher Burrow Mux.
 //
-// Gopher Burrow Web Subroutine is free software: you can redistribute it and/or modify
+// Gopher Burrow Web Subroutines is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
-// Gopher Burrow Web Subroutine is distributed in the hope that it will be useful,
+// Gopher Burrow Web Subroutines is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with Gopher Burrow Web Subroutine.  If not, see <http://www.gnu.org/licenses/>.
+// along with Gopher Burrow Web Subroutines.  If not, see <http://www.gnu.org/licenses/>.
 
 //Package websub contains a Web GOSUB/RETURN mechanism in a server-stateless manner using JWT cookies and redirects.
 //
@@ -25,6 +25,7 @@
 package websub
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -33,7 +34,8 @@ import (
 
 const (
 	//DefaultCookieNamePrefix stores the default cookie name prefix that will be used if no savdreq.Config.SetCookieNamePrefix() method is called.
-	DefaultCookieNamePrefix = "SavedRequest-"
+	DefaultCookieNamePrefix = "OriginalRequest-"
+	DefaultTimeoutSeconds   = 300
 )
 
 //Config stores the configuration for a set of HTTP resources that will be protected against CSRF attacks.
@@ -45,13 +47,17 @@ type Config struct {
 	NoStateHandler   http.Handler
 	cookieNamePrefix string
 	queryParamName   string
+	timeoutSeconds   int
 }
 
-func Gosub(w http.ResponseWriter, r *http.Request, targetUrl string, timeoutSeconds int) error {
+func Gosub(w http.ResponseWriter, r *http.Request, targetURL string) error {
 
 	var c *Config
 
-	if r == null {
+	if r == nil {
+	}
+
+	if targetURL == "" {
 	}
 
 	if timeoutSeconds <= 0 {
@@ -78,19 +84,76 @@ func Gosub(w http.ResponseWriter, r *http.Request, targetUrl string, timeoutSeco
 	cookie := &http.Cookie{
 		Name:   c.cookieNamePrefix,
 		Value:  t,
-		MaxAge: timeoutSeconds,
+		MaxAge: c.timeoutSeconds,
+		Path:   targetURL, //TODO All URL fields must be tested
 	}
 	http.SetCookie(w, cookie)
 
+	http.Redirect(w, r, targetUrl, http.StatusSeeOther)
 	return nil
+}
+
+func Check(r *http.Request) error {
+	var c *Config
+
+	state := r.URL.Query().Get(c.queryParamName)
+
+	if state == "" {
+		return fmt.Errorf("")
+	}
+
+	for _, cookie := range r.Cookies() {
+		if cookie.Name != c.cookieNamePrefix+state {
+			continue
+		}
+
+		v := cookie.Value
+
+		//Recover the secret handling errors.
+		s, err := secret(c, r)
+		if err != nil {
+			return err
+		}
+
+		//Test if it is ours token (verifying the signature), and not a token created by an attacker.
+		var claims map[string]interface{}
+		if claims, err := jwt.ValidateHS256(v, s); err != nil {
+			return ErrTokenSignatureMustMatch
+		}
+
+		expNumDate, ok := claims[jwt.ClaimExpirationTime].(int64)
+		if !ok {
+			return ErrTokenMissingExpField
+		}
+
+		expTime := jwt.Time(expNumDate)
+		if time.Now().After(expTime) {
+			return ErrTokenExpired
+		}
+
+		aud, ok := claims[jwt.ClaimExpirationTime].(string)
+		if !ok {
+			return ErrTokenMissingAudField
+		}
+
+		//TODO Test if aud is current URL
+
+		iss, ok := claims[jwt.ClaimExpirationTime].(string)
+		if !ok {
+			return ErrTokenMissingIssField
+		}
+
+		//TODO Test if aud is current URL
+
+		break
+	}
 
 }
 
-func Check(w http.ResponseWriter, r *http.Request) error {
-
-}
-
-func Return() {
+func Return(w http.ResponseWriter, r *http.Request) error {
+	if err := Check(r); err != nil {
+		return err
+	}
 
 }
 

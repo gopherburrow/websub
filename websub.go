@@ -36,15 +36,15 @@ const (
 )
 
 var (
-	ErrRequestMustBeNonNil     = errors.New("")
-	ErrConfigMustBeNonNil      = errors.New("")
-	ErrTokenSignatureMustMatch = errors.New("")
-	ErrTokenMissingAudField    = errors.New("")
-	ErrRequestMustMatchAud     = errors.New("")
-	ErrTokenMissingIssField    = errors.New("")
-	ErrTokenExpired            = errors.New("")
-	ErrTokenNotFound           = errors.New("")
-	ErrSecretError             = errors.New("")
+	ErrRequestMustBeNonNil     = errors.New("websub: request must be non nil")
+	ErrConfigMustBeNonNil      = errors.New("websub: config must be non nil")
+	ErrTokenSignatureMustMatch = errors.New("websub: token signature must match")
+	ErrTokenMissingAudField    = errors.New("websub: token missing aud field")
+	ErrRequestMustMatchAud     = errors.New("websub: request must match aud field")
+	ErrTokenMissingIssField    = errors.New("websub: token missing iss field")
+	ErrTokenExpired            = errors.New("websub: token expired")
+	ErrTokenNotFound           = errors.New("websub: token not found")
+	ErrSecretError             = errors.New("websub: the token secret cannot be empty ")
 )
 
 //Config stores the configuration for a set of HTTP resources that will be protected against CSRF attacks.
@@ -111,6 +111,23 @@ func Gosub(w http.ResponseWriter, r *http.Request, c *Config) error {
 	return nil
 }
 
+// func Refresh(w http.ResponseWriter, r *http.Request) error {
+// 	if err := Check(r); err != nil {
+// 		return err
+// 	}
+
+// }
+
+func Return(w http.ResponseWriter, r *http.Request, c *Config) error {
+	returnURL, err := validateReturnURL(r, c)
+	if err != nil {
+		return err
+	}
+
+	http.Redirect(w, r, returnURL, http.StatusSeeOther)
+	return nil
+}
+
 func validateReturnURL(r *http.Request, c *Config) (string, error) {
 	stackCookie := c.CookieName(r)
 
@@ -160,23 +177,6 @@ func validateReturnURL(r *http.Request, c *Config) (string, error) {
 	}
 
 	return "", ErrTokenNotFound
-}
-
-// func Refresh(w http.ResponseWriter, r *http.Request) error {
-// 	if err := Check(r); err != nil {
-// 		return err
-// 	}
-
-// }
-
-func Return(w http.ResponseWriter, r *http.Request, c *Config) error {
-	returnURL, err := validateReturnURL(r, c)
-	if err != nil {
-		return err
-	}
-
-	http.Redirect(w, r, returnURL, http.StatusSeeOther)
-	return nil
 }
 
 func secret(c *Config, r *http.Request) ([]byte, error) {

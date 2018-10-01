@@ -15,17 +15,14 @@
 
 //Package websub contains a Web GOSUB/RETURN mechanism in a server-stateless manner using JWT cookies and redirects.
 //
-//GOSUB and RETURN were keywords in certain old BASIC dialect programming languages that not supported structured functions.
-//GOSUB was similar to a function call, but without the well-defined parameters and RETURN did not accepted return values.
-//The scope of these parameters lived outsided the function call, somewhere in the program body.
-//So GOSUB/RETURN keywords only cared about the call stack.
-//
-//In that sense this package works the same. In a fully stateless design, only the call (websub.Gosub) and return (websub.Return) are
-//handled by this package, using JWT cookies and state (function call id).
+//GOSUB and RETURN were keywords in certain old BASIC programming language dialects that not supported structured functions,
+//and do not formalize any way the data is passed.
+//In that sense this package works the same way. In a fully stateless design, only the call (websub.Gosub) and return (websub.Return) are
+//handled by this package, using JWT cookies and a query parameter that identifies the call.
 package websub
 
 import (
-	"fmt"
+	"errors"
 	"net/http"
 	"time"
 
@@ -38,36 +35,53 @@ const (
 	DefaultTimeoutSeconds   = 300
 )
 
+var (
+	ErrRequestMustBeNonNil     = errors.New("")
+	ErrConfigMustBeNonNil      = errors.New("")
+	ErrTokenSignatureMustMatch = errors.New("")
+	ErrTokenMissingAudField    = errors.New("")
+	ErrRequestMustMatchAud     = errors.New("")
+	ErrTokenMissingIssField    = errors.New("")
+	ErrTokenExpired            = errors.New("")
+	ErrTokenNotFound           = errors.New("")
+	ErrSecretError             = errors.New("")
+)
+
 //Config stores the configuration for a set of HTTP resources that will be protected against CSRF attacks.
 type Config struct {
 	//SecretFunc is a function that will be used to create the secret for the HMAC-SHA256 signature for the Web Subroutine JWT Token.
 	//It can be used to rotate the secret, shared the between multiple instances of a Handler or even multiple server instances.
-	//It MUST not return a nil secret or an empty one.
-	SecretFunc       func(r *http.Request) []byte
-	NoStateHandler   http.Handler
-	cookieNamePrefix string
-	queryParamName   string
-	timeoutSeconds   int
+	//It MUST be non nil and, when called, return NEITHER a nil secret NOR an empty one.
+	SecretFunc     func(r *http.Request) []byte
+	CookieName     func(r *http.Request) string
+	TargetURL      func(r *http.Request) string
+	TimeoutSeconds int
 }
 
-func Gosub(w http.ResponseWriter, r *http.Request, targetURL string) error {
-
-	var c *Config
-
+func Gosub(w http.ResponseWriter, r *http.Request, c *Config) error {
 	if r == nil {
+		return ErrRequestMustBeNonNil
 	}
+
+	if c == nil {
+		return ErrConfigMustBeNonNil
+	}
+
+	targetURL := c.TargetURL(r)
 
 	if targetURL == "" {
 	}
 
-	if timeoutSeconds <= 0 {
-	}
+	//TODO check target Url
 
 	//Create JWT Claims
 	claims := map[string]interface{}{
-		jwt.ClaimIssuedAt:       r.URL.String(),
-		jwt.ClaimAudience:       targetUrl,
-		jwt.ClaimExpirationTime: jwt.NumericDate(time.Now().Add(time.Duration(timeoutSeconds) * time.Second)),
+		jwt.ClaimIssuedAt: r.URL.String(),
+		jwt.ClaimAudience: targetURL,
+	}
+
+	if c.TimeoutSeconds > 0 {
+		claims[jwt.ClaimExpirationTime] = jwt.NumericDate(time.Now().Add(time.Duration(c.TimeoutSeconds) * time.Second))
 	}
 
 	//Recover the secret and handle errors.
@@ -82,82 +96,90 @@ func Gosub(w http.ResponseWriter, r *http.Request, targetURL string) error {
 	}
 
 	cookie := &http.Cookie{
-		Name:   c.cookieNamePrefix,
-		Value:  t,
-		MaxAge: c.timeoutSeconds,
-		Path:   targetURL, //TODO All URL fields must be tested
+		Name:  c.CookieName(r),
+		Value: t,
+		Path:  targetURL, //TODO All URL fields must be tested
 	}
+
+	if c.TimeoutSeconds > 0 {
+		cookie.MaxAge = c.TimeoutSeconds
+	}
+
 	http.SetCookie(w, cookie)
 
-	http.Redirect(w, r, targetUrl, http.StatusSeeOther)
+	http.Redirect(w, r, targetURL, http.StatusSeeOther)
 	return nil
 }
 
-func Check(r *http.Request) error {
-	var c *Config
-
-	state := r.URL.Query().Get(c.queryParamName)
-
-	if state == "" {
-		return fmt.Errorf("")
-	}
+func validateReturnURL(r *http.Request, c *Config) (string, error) {
+	stackCookie := c.CookieName(r)
 
 	for _, cookie := range r.Cookies() {
-		if cookie.Name != c.cookieNamePrefix+state {
+		if cookie.Name != stackCookie {
 			continue
 		}
 
 		v := cookie.Value
 
-		//Recover the secret handling errors.
+		//Recover the secret and handle errors.
 		s, err := secret(c, r)
 		if err != nil {
-			return err
+			return "", err
 		}
 
 		//Test if it is ours token (verifying the signature), and not a token created by an attacker.
-		var claims map[string]interface{}
-		if claims, err := jwt.ValidateHS256(v, s); err != nil {
-			return ErrTokenSignatureMustMatch
+		claims, err := jwt.ValidateHS256(v, s)
+		if err != nil {
+			return "", ErrTokenSignatureMustMatch
 		}
 
-		expNumDate, ok := claims[jwt.ClaimExpirationTime].(int64)
+		audif, ok := (*claims)[jwt.ClaimAudience]
 		if !ok {
-			return ErrTokenMissingExpField
+			return "", ErrTokenMissingAudField
 		}
 
-		expTime := jwt.Time(expNumDate)
-		if time.Now().After(expTime) {
-			return ErrTokenExpired
+		if aud, ok := audif.(string); ok && r.URL.String() != aud {
+			return "", ErrRequestMustMatchAud
 		}
 
-		aud, ok := claims[jwt.ClaimExpirationTime].(string)
+		issif, ok := (*claims)[jwt.ClaimIssuer]
 		if !ok {
-			return ErrTokenMissingAudField
+			return "", ErrTokenMissingIssField
 		}
 
-		//TODO Test if aud is current URL
+		iss, ok := issif.(string)
+		//TODO check iss Url
 
-		iss, ok := claims[jwt.ClaimExpirationTime].(string)
-		if !ok {
-			return ErrTokenMissingIssField
+		if expNumDate, ok := (*claims)[jwt.ClaimExpirationTime].(int64); ok {
+			if expTime := jwt.Time(expNumDate); time.Now().After(expTime) {
+				return "", ErrTokenExpired
+			}
 		}
 
-		//TODO Test if aud is current URL
-
-		break
+		return iss, nil
 	}
 
+	return "", ErrTokenNotFound
 }
 
-func Return(w http.ResponseWriter, r *http.Request) error {
-	if err := Check(r); err != nil {
+// func Refresh(w http.ResponseWriter, r *http.Request) error {
+// 	if err := Check(r); err != nil {
+// 		return err
+// 	}
+
+// }
+
+func Return(w http.ResponseWriter, r *http.Request, c *Config) error {
+	returnURL, err := validateReturnURL(r, c)
+	if err != nil {
 		return err
 	}
 
+	http.Redirect(w, r, returnURL, http.StatusSeeOther)
+	return nil
 }
 
-func secret(c *Config, r *http.Request) ([]byte, *WebError) {
+func secret(c *Config, r *http.Request) ([]byte, error) {
 	//Retrieve the Token secret (Custom or generated). Handle errors.
 	if c.SecretFunc == nil {
 		return nil, ErrSecretError

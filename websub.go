@@ -23,7 +23,10 @@ package websub
 
 import (
 	"errors"
+	"math/rand"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
 	"gitlab.com/gopherburrow/jwt"
@@ -31,13 +34,15 @@ import (
 
 const (
 	//DefaultCookieNamePrefix stores the default cookie name prefix that will be used if no savdreq.Config.SetCookieNamePrefix() method is called.
-	DefaultCookieNamePrefix = "OriginalRequest-"
-	DefaultTimeoutSeconds   = 300
+	DefaultCookieName     = "Original-Request-"
+	DefaultTraceParam     = "orig-req"
+	DefaultTimeoutSeconds = 300
 )
 
 var (
 	ErrRequestMustBeNonNil     = errors.New("websub: request must be non nil")
-	ErrConfigMustBeNonNil      = errors.New("websub: config must be non nil")
+	ErrTargetURLMustBeNotEmpty = errors.New("websub: targetURL must be not empty")
+	ErrTargetURLMustBeValid    = errors.New("websub: targetURL must be valid")
 	ErrTokenSignatureMustMatch = errors.New("websub: token signature must match")
 	ErrTokenMissingAudField    = errors.New("websub: token missing aud field")
 	ErrRequestMustMatchAud     = errors.New("websub: request must match aud field")
@@ -52,40 +57,56 @@ type Config struct {
 	//SecretFunc is a function that will be used to create the secret for the HMAC-SHA256 signature for the Web Subroutine JWT Token.
 	//It can be used to rotate the secret, shared the between multiple instances of a Handler or even multiple server instances.
 	//It MUST be non nil and, when called, return NEITHER a nil secret NOR an empty one.
-	SecretFunc     func(r *http.Request) []byte
-	CookieName     func(r *http.Request) string
-	TargetURL      func(r *http.Request) string
+	Secret func(r *http.Request) []byte
+	//CookieName stores a custom user defined cookie name prefix used to store the WebCall Token.
+	//It can only be set in SetName(name) method.
+	CookieName     string
+	TraceParam     string
 	TimeoutSeconds int
 }
 
-func Gosub(w http.ResponseWriter, r *http.Request, c *Config) error {
+func (wc *Config) Gosub(w http.ResponseWriter, r *http.Request, targetURL string) error {
 	if r == nil {
 		return ErrRequestMustBeNonNil
 	}
 
-	if c == nil {
-		return ErrConfigMustBeNonNil
-	}
-
-	targetURL := c.TargetURL(r)
-
 	if targetURL == "" {
+		return ErrTargetURLMustBeNotEmpty
 	}
 
-	//TODO check target Url
+	templateURL, err := url.Parse(targetURL)
+	if err != nil {
+		return ErrTargetURLMustBeValid
+	}
+
+	traceParam := wc.TraceParam
+	if traceParam == "" {
+		traceParam = DefaultTraceParam
+	}
+
+	traceValue := strconv.FormatInt(rand.Int63(), 16)
+	q := templateURL.Query()
+	q.Add(traceParam, traceValue)
+	templateURL.RawQuery = q.Encode()
+	callURL := templateURL.String()
 
 	//Create JWT Claims
 	claims := map[string]interface{}{
-		jwt.ClaimIssuedAt: r.URL.String(),
-		jwt.ClaimAudience: targetURL,
+		jwt.ClaimIssuer:   r.URL.String(),
+		jwt.ClaimAudience: callURL,
 	}
 
-	if c.TimeoutSeconds > 0 {
-		claims[jwt.ClaimExpirationTime] = jwt.NumericDate(time.Now().Add(time.Duration(c.TimeoutSeconds) * time.Second))
+	timeoutSeconds := wc.TimeoutSeconds
+	if timeoutSeconds == 0 {
+		timeoutSeconds = DefaultTimeoutSeconds
+	}
+
+	if timeoutSeconds > 0 {
+		claims[jwt.ClaimExpirationTime] = jwt.NumericDate(time.Now().Add(time.Duration(timeoutSeconds) * time.Second))
 	}
 
 	//Recover the secret and handle errors.
-	s, err := secret(c, r)
+	s, err := secret(wc, r)
 	if err != nil {
 		return err
 	}
@@ -95,19 +116,34 @@ func Gosub(w http.ResponseWriter, r *http.Request, c *Config) error {
 		return err
 	}
 
-	cookie := &http.Cookie{
-		Name:  c.CookieName(r),
-		Value: t,
-		Path:  targetURL, //TODO All URL fields must be tested
+	cookieName := wc.CookieName
+	if cookieName == "" {
+		cookieName = DefaultCookieName
 	}
 
-	if c.TimeoutSeconds > 0 {
-		cookie.MaxAge = c.TimeoutSeconds
+	var cookieDomain string
+	if templateURL.IsAbs() {
+		cookieDomain = templateURL.Hostname()
+	}
+	if cookieDomain == "" {
+		cookieDomain = stripPort(r.Host)
+	}
+
+	cookie := &http.Cookie{
+		Name:     cookieName + traceValue,
+		Value:    t,
+		Domain:   cookieDomain,
+		Path:     templateURL.Path,
+		HttpOnly: true,
+		//FIXME Secure:   true,
+	}
+	if timeoutSeconds > 0 {
+		cookie.MaxAge = timeoutSeconds
 	}
 
 	http.SetCookie(w, cookie)
 
-	http.Redirect(w, r, targetURL, http.StatusSeeOther)
+	http.Redirect(w, r, callURL, http.StatusSeeOther)
 	return nil
 }
 
@@ -118,28 +154,68 @@ func Gosub(w http.ResponseWriter, r *http.Request, c *Config) error {
 
 // }
 
-func Return(w http.ResponseWriter, r *http.Request, c *Config) error {
-	returnURL, err := validateReturnURL(r, c)
+func (wc *Config) CheckTransience(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+}
+
+//header("Expires: Sat, 26 Jul 1997 05:00:00
+
+func (wc *Config) Return(w http.ResponseWriter, r *http.Request) error {
+	returnURL, err := validateReturnURL(wc, r)
 	if err != nil {
 		return err
 	}
+
+	cookieName := wc.CookieName
+	if cookieName == "" {
+		cookieName = DefaultCookieName
+	}
+
+	traceParam := wc.TraceParam
+	if traceParam == "" {
+		traceParam = DefaultTraceParam
+	}
+	traceValue := r.URL.Query().Get(traceParam)
+
+	cookieDomain := stripPort(r.Host)
+
+	cookie := &http.Cookie{
+		Name:     cookieName + traceValue,
+		Domain:   cookieDomain,
+		Path:     r.URL.Path,
+		HttpOnly: true,
+		//FIXME Secure:   true,
+		MaxAge: -1,
+	}
+
+	http.SetCookie(w, cookie)
 
 	http.Redirect(w, r, returnURL, http.StatusSeeOther)
 	return nil
 }
 
-func validateReturnURL(r *http.Request, c *Config) (string, error) {
-	stackCookie := c.CookieName(r)
+func validateReturnURL(wc *Config, r *http.Request) (string, error) {
+	cookieName := wc.CookieName
+	if cookieName == "" {
+		cookieName = DefaultCookieName
+	}
+
+	traceParam := wc.TraceParam
+	if traceParam == "" {
+		traceParam = DefaultTraceParam
+	}
+	traceValue := r.URL.Query().Get(traceParam)
 
 	for _, cookie := range r.Cookies() {
-		if cookie.Name != stackCookie {
+		if cookie.Name != cookieName+traceValue {
 			continue
 		}
 
 		v := cookie.Value
 
 		//Recover the secret and handle errors.
-		s, err := secret(c, r)
+		s, err := secret(wc, r)
 		if err != nil {
 			return "", err
 		}
@@ -179,12 +255,12 @@ func validateReturnURL(r *http.Request, c *Config) (string, error) {
 	return "", ErrTokenNotFound
 }
 
-func secret(c *Config, r *http.Request) ([]byte, error) {
+func secret(wc *Config, r *http.Request) ([]byte, error) {
 	//Retrieve the Token secret (Custom or generated). Handle errors.
-	if c.SecretFunc == nil {
+	if wc.Secret == nil {
 		return nil, ErrSecretError
 	}
-	secret := c.SecretFunc(r)
+	secret := wc.Secret(r)
 	//It is part of the contract. Never return an empty secret. (Because it is no secret that way.)
 	if secret == nil || len(secret) == 0 {
 		return nil, ErrSecretError

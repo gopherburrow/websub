@@ -22,11 +22,11 @@
 package websub
 
 import (
+	"encoding/base64"
 	"errors"
 	"math/rand"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 
 	"gitlab.com/gopherburrow/jwt"
@@ -34,9 +34,9 @@ import (
 
 const (
 	//DefaultCookieNamePrefix stores the default cookie name prefix that will be used if no savdreq.Config.SetCookieNamePrefix() method is called.
-	DefaultCookieName     = "Original-Request-"
-	DefaultTraceParam     = "orig-req"
-	DefaultTimeoutSeconds = 300
+	DefaultCookieName     = "State-"
+	DefaultStateParam     = "state"
+	DefaultTimeoutSeconds = 120
 )
 
 var (
@@ -65,7 +65,7 @@ type Config struct {
 	//CookieName stores a custom user defined cookie name prefix used to store the WebCall Token.
 	//It can only be set in SetName(name) method.
 	CookieName     string
-	TraceParam     string
+	StateParam     string
 	TimeoutSeconds int
 }
 
@@ -78,46 +78,177 @@ func (wc *Config) Gosub(w http.ResponseWriter, r *http.Request, targetURL string
 		return ErrTargetURLMustBeNotEmpty
 	}
 
-	parsedTargetURL, err := url.Parse(targetURL)
+	issURL := absolutizeURL(r.URL, getScheme(r), r.Host)
+
+	audURL, err := url.Parse(targetURL)
 	if err != nil {
 		return ErrTargetURLMustBeValid
 	}
+	audURL = absolutizeURL(audURL, getScheme(r), r.Host)
 
-	if !parsedTargetURL.IsAbs() {
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
+	sv := make([]byte, 3)
+	rand.Read(sv)
+	stateValue := base64.RawURLEncoding.EncodeToString(sv)
+
+	q := audURL.Query()
+	q.Set(stateParam(wc), stateValue)
+	audURL.RawQuery = q.Encode()
+
+	if err := createTokenCookie(wc, w, r, issURL.String(), audURL.String(), stateValue); err != nil {
+		return err
+	}
+
+	http.Redirect(w, r, audURL.String(), http.StatusTemporaryRedirect)
+	return nil
+}
+
+func (wc *Config) Return(w http.ResponseWriter, r *http.Request) error {
+	iss, aud, err := validateAndIssAud(wc, r)
+	if err != nil {
+		return err
+	}
+
+	audURL, err := url.Parse(aud)
+	if err != nil {
+		return err
+	}
+
+	stateValue := r.URL.Query().Get(stateParam(wc))
+
+	//Delete the Web Subroutine Cookie.
+	cookie := &http.Cookie{
+		Name:     cookieName(wc) + stateValue,
+		Domain:   audURL.Hostname(),
+		Path:     r.URL.Path,
+		HttpOnly: true,
+		//FIXME Secure:   true,
+		MaxAge: -1,
+	}
+	http.SetCookie(w, cookie)
+
+	http.Redirect(w, r, iss, http.StatusSeeOther)
+	return nil
+}
+
+func (wc *Config) MissingState(r *http.Request) bool {
+	_, _, err := validateAndIssAud(wc, r)
+	return err != nil
+}
+
+func (wc *Config) Refresh(w http.ResponseWriter, r *http.Request) error {
+	iss, aud, err := validateAndIssAud(wc, r)
+	if err != nil {
+		return err
+	}
+
+	stateValue := r.URL.Query().Get(stateParam(wc))
+	if err := createTokenCookie(wc, w, r, iss, aud, stateValue); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+//header("Expires: Sat, 26 Jul 1997 05:00:00
+
+func validateAndIssAud(wc *Config, r *http.Request) (iss, aud string, err error) {
+	stateValue := r.URL.Query().Get(stateParam(wc))
+
+	c, err := r.Cookie(cookieName(wc) + stateValue)
+	if c == nil || err == http.ErrNoCookie {
+		return "", "", ErrTokenNotFound
+	}
+	if err != nil {
+		return "", "", err
+	}
+	v := c.Value
+
+	//Recover the secret and handle errors.
+	s, err := secret(wc, r)
+	if err != nil {
+		return "", "", err
+	}
+
+	//Test if it is ours token (verifying the signature), and not a token created by an attacker.
+	claims, err := jwt.ValidateHS256(v, s)
+	if err != nil {
+		return "", "", ErrTokenSignatureMustMatch
+	}
+
+	audif, ok := (*claims)[jwt.ClaimAudience]
+	if !ok {
+		return "", "", ErrTokenMissingAudField
+	}
+
+	if aud, ok := audif.(string); !ok || absolutizeURL(r.URL, getScheme(r), r.Host).String() != aud {
+		return "", "", ErrRequestMustMatchAud
+	}
+
+	issif, ok := (*claims)[jwt.ClaimIssuer]
+	if !ok {
+		return "", "", ErrTokenMissingIssField
+	}
+
+	iss, ok = issif.(string)
+	//TODO check iss Url
+
+	if expNumDate, ok := (*claims)[jwt.ClaimExpirationTime].(int64); ok {
+		if expTime := jwt.Time(expNumDate); time.Now().After(expTime) {
+			return "", "", ErrTokenExpired
 		}
-		parsedTargetURL.Scheme = scheme
-		parsedTargetURL.Host = r.Host
 	}
 
-	traceParam := wc.TraceParam
-	if traceParam == "" {
-		traceParam = DefaultTraceParam
+	return iss, aud, nil
+}
+
+func getScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func absolutizeURL(u *url.URL, scheme, host string) *url.URL {
+	au := new(url.URL)
+	*au = *u
+	if au.IsAbs() {
+		return au
+	}
+	au.Scheme = scheme
+	au.Host = host
+	return au
+}
+
+func cookieName(wc *Config) string {
+	if wc.CookieName == "" {
+		return DefaultCookieName
 	}
 
-	traceValue := strconv.FormatInt(rand.Int63(), 16)
-	q := parsedTargetURL.Query()
-	q.Add(traceParam, traceValue)
-	parsedTargetURL.RawQuery = q.Encode()
-	finalTargetURL := parsedTargetURL.String()
+	return wc.CookieName
+}
 
-	parsedRequestURL := urlFromRequest(r)
+func stateParam(wc *Config) string {
+	if wc.StateParam == "" {
+		return DefaultStateParam
+	}
 
+	return wc.StateParam
+}
+
+func createTokenCookie(wc *Config, w http.ResponseWriter, r *http.Request, iss, aud, stateValue string) error {
 	//Create JWT Claims
 	claims := map[string]interface{}{
-		jwt.ClaimIssuer:   parsedRequestURL.String(),
-		jwt.ClaimAudience: finalTargetURL,
+		jwt.ClaimIssuer:   iss,
+		jwt.ClaimAudience: aud,
 	}
 
-	timeoutSeconds := wc.TimeoutSeconds
-	if timeoutSeconds == 0 {
-		timeoutSeconds = DefaultTimeoutSeconds
+	timeout := wc.TimeoutSeconds
+	if timeout == 0 {
+		timeout = DefaultTimeoutSeconds
 	}
 
-	if timeoutSeconds > 0 {
-		claims[jwt.ClaimExpirationTime] = jwt.NumericDate(time.Now().Add(time.Duration(timeoutSeconds) * time.Second))
+	if timeout > 0 {
+		claims[jwt.ClaimExpirationTime] = jwt.NumericDate(time.Now().Add(time.Duration(timeout) * time.Second))
 	}
 
 	//Recover the secret and handle errors.
@@ -131,157 +262,25 @@ func (wc *Config) Gosub(w http.ResponseWriter, r *http.Request, targetURL string
 		return err
 	}
 
-	cookieName := wc.CookieName
-	if cookieName == "" {
-		cookieName = DefaultCookieName
-	}
-
-	var cookieDomain string
-	if parsedTargetURL.IsAbs() {
-		cookieDomain = parsedTargetURL.Hostname()
-	}
-	if cookieDomain == "" {
-		cookieDomain = stripPort(r.Host)
-	}
-
-	cookie := &http.Cookie{
-		Name:     cookieName + traceValue,
-		Value:    t,
-		Domain:   cookieDomain,
-		Path:     parsedTargetURL.Path,
-		HttpOnly: true,
-		//FIXME Secure:   true,
-	}
-	if timeoutSeconds > 0 {
-		cookie.MaxAge = timeoutSeconds
-	}
-
-	http.SetCookie(w, cookie)
-
-	http.Redirect(w, r, finalTargetURL, http.StatusSeeOther)
-	return nil
-}
-
-// func Refresh(w http.ResponseWriter, r *http.Request) error {
-// 	if err := Check(r); err != nil {
-// 		return err
-// 	}
-
-// }
-
-//header("Expires: Sat, 26 Jul 1997 05:00:00
-
-func (wc *Config) Return(w http.ResponseWriter, r *http.Request) error {
-	returnURL, err := validateReturnURL(wc, r)
+	audURL, err := url.Parse(aud)
 	if err != nil {
 		return err
 	}
 
-	cookieName := wc.CookieName
-	if cookieName == "" {
-		cookieName = DefaultCookieName
-	}
-
-	traceParam := wc.TraceParam
-	if traceParam == "" {
-		traceParam = DefaultTraceParam
-	}
-	traceValue := r.URL.Query().Get(traceParam)
-
-	cookieDomain := stripPort(r.Host)
-
-	//Delete the Web Subroutine Cookie.
 	cookie := &http.Cookie{
-		Name:     cookieName + traceValue,
-		Domain:   cookieDomain,
-		Path:     r.URL.Path,
+		Name:     cookieName(wc) + stateValue,
+		Value:    t,
+		Domain:   audURL.Hostname(),
+		Path:     audURL.Path,
 		HttpOnly: true,
 		//FIXME Secure:   true,
-		MaxAge: -1,
 	}
+	if timeout > 0 {
+		cookie.MaxAge = timeout
+	}
+
 	http.SetCookie(w, cookie)
-
-	http.Redirect(w, r, returnURL, http.StatusSeeOther)
 	return nil
-}
-
-func validateReturnURL(wc *Config, r *http.Request) (string, error) {
-	cookieName := wc.CookieName
-	if cookieName == "" {
-		cookieName = DefaultCookieName
-	}
-
-	traceParam := wc.TraceParam
-	if traceParam == "" {
-		traceParam = DefaultTraceParam
-	}
-	traceValue := r.URL.Query().Get(traceParam)
-
-	var cookie *http.Cookie
-	for _, c := range r.Cookies() {
-		if c.Name == cookieName+traceValue {
-			cookie = c
-			break
-		}
-	}
-
-	if cookie == nil {
-		return "", ErrTokenNotFound
-	}
-
-	v := cookie.Value
-
-	//Recover the secret and handle errors.
-	s, err := secret(wc, r)
-	if err != nil {
-		return "", err
-	}
-
-	//Test if it is ours token (verifying the signature), and not a token created by an attacker.
-	claims, err := jwt.ValidateHS256(v, s)
-	if err != nil {
-		return "", ErrTokenSignatureMustMatch
-	}
-
-	audif, ok := (*claims)[jwt.ClaimAudience]
-	if !ok {
-		return "", ErrTokenMissingAudField
-	}
-
-	if aud, ok := audif.(string); ok && urlFromRequest(r).String() != aud {
-		return "", ErrRequestMustMatchAud
-	}
-
-	issif, ok := (*claims)[jwt.ClaimIssuer]
-	if !ok {
-		return "", ErrTokenMissingIssField
-	}
-
-	iss, ok := issif.(string)
-	//TODO check iss Url
-
-	if expNumDate, ok := (*claims)[jwt.ClaimExpirationTime].(int64); ok {
-		if expTime := jwt.Time(expNumDate); time.Now().After(expTime) {
-			return "", ErrTokenExpired
-		}
-	}
-
-	return iss, nil
-}
-
-func urlFromRequest(r *http.Request) *url.URL {
-	parsedRequestURL := new(url.URL)
-	*parsedRequestURL = *r.URL
-	if !parsedRequestURL.IsAbs() {
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		parsedRequestURL.Scheme = scheme
-		parsedRequestURL.Host = r.Host
-	}
-
-	return parsedRequestURL
 }
 
 func secret(wc *Config, r *http.Request) ([]byte, error) {

@@ -19,7 +19,7 @@
 //and do not formalize any way the data is passed.
 //In that sense this package works the same way. In a fully stateless design, only the call (websub.Gosub) and return (websub.Return) are
 //handled by this package, using JWT cookies and a query parameter that identifies the call.
-package websub
+package gosub
 
 import (
 	"encoding/base64"
@@ -69,7 +69,7 @@ type Config struct {
 	TimeoutSeconds int
 }
 
-func (wc *Config) Gosub(w http.ResponseWriter, r *http.Request, targetURL string) error {
+func (wc *Config) Call(w http.ResponseWriter, r *http.Request, targetURL string) error {
 	if r == nil {
 		return ErrRequestMustBeNonNil
 	}
@@ -130,7 +130,7 @@ func (wc *Config) Return(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func (wc *Config) MissingState(r *http.Request) bool {
+func (wc *Config) IsValid(r *http.Request) bool {
 	_, _, err := validateAndIssAud(wc, r)
 	return err != nil
 }

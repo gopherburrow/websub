@@ -13,11 +13,11 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with Gopher Burrow Web Subroutines.  If not, see <http://www.gnu.org/licenses/>.
 
-//Package websub contains a Web GOSUB/RETURN mechanism in a server-stateless manner using JWT cookies and redirects.
+//Package gosub contains a Web GOSUB/RETURN mechanism in a server-stateless manner using JWT cookies and redirects.
 //
-//GOSUB and RETURN were keywords in certain old BASIC programming language dialects that not supported structured functions,
-//and do not formalize any way the data is passed.
-//In that sense this package works the same way. In a fully stateless design, only the call (websub.Gosub) and return (websub.Return) are
+//GOSUB and RETURN were keywords in certain old BASIC programming language dialects that did not support structured functions,
+//and did not formalize any way the data was passed (There were no parameters).
+//In that sense this package works the same way. In a fully stateless design, only the call (gosub.Call) and return (gosub.Return) are
 //handled by this package, using JWT cookies and a query parameter that identifies the call.
 package gosub
 
@@ -33,23 +33,23 @@ import (
 )
 
 const (
-	//DefaultCookieNamePrefix stores the default cookie name prefix that will be used if no savdreq.Config.SetCookieNamePrefix() method is called.
-	DefaultCookieName     = "State-"
-	DefaultStateParam     = "state"
-	DefaultTimeoutSeconds = 120
+	//DefaultCookieNamePrefix stores the default cookie name prefix that will be used if no gosub.Config.SetCookieNamePrefix() method is called.
+	DefaultCookieNamePrefix = "State-"
+	DefaultStateParam       = "state"
+	DefaultTimeoutSeconds   = 120
 )
 
 var (
-	ErrRequestMustBeNonNil     = errors.New("websub: request must be non nil")
-	ErrTargetURLMustBeNotEmpty = errors.New("websub: targetURL must be not empty")
-	ErrTargetURLMustBeValid    = errors.New("websub: targetURL must be valid")
-	ErrTokenSignatureMustMatch = errors.New("websub: token signature must match")
-	ErrTokenMissingAudField    = errors.New("websub: token missing aud field")
-	ErrRequestMustMatchAud     = errors.New("websub: request must match aud field")
-	ErrTokenMissingIssField    = errors.New("websub: token missing iss field")
-	ErrTokenExpired            = errors.New("websub: token expired")
-	ErrTokenNotFound           = errors.New("websub: token not found")
-	ErrSecretError             = errors.New("websub: the token secret cannot be empty ")
+	ErrRequestMustBeNonNil     = errors.New("gosub: request must be non nil")
+	ErrTargetURLMustBeNotEmpty = errors.New("gosub: targetURL must be not empty")
+	ErrTargetURLMustBeValid    = errors.New("gosub: targetURL must be valid")
+	ErrTokenSignatureMustMatch = errors.New("gosub: token signature must match")
+	ErrTokenMissingAudField    = errors.New("gosub: token missing aud field")
+	ErrRequestMustMatchAud     = errors.New("gosub: request must match aud field")
+	ErrTokenMissingIssField    = errors.New("gosub: token missing iss field")
+	ErrTokenExpired            = errors.New("gosub: token expired")
+	ErrTokenNotFound           = errors.New("gosub: token not found")
+	ErrSecretError             = errors.New("gosub: the token secret cannot be empty ")
 )
 
 func SetTransientPage(w http.ResponseWriter) {
@@ -69,7 +69,7 @@ type Config struct {
 	TimeoutSeconds int
 }
 
-func (wc *Config) Call(w http.ResponseWriter, r *http.Request, targetURL string) error {
+func (c *Config) Call(w http.ResponseWriter, r *http.Request, targetURL string) error {
 	if r == nil {
 		return ErrRequestMustBeNonNil
 	}
@@ -91,10 +91,10 @@ func (wc *Config) Call(w http.ResponseWriter, r *http.Request, targetURL string)
 	stateValue := base64.RawURLEncoding.EncodeToString(sv)
 
 	q := audURL.Query()
-	q.Set(stateParam(wc), stateValue)
+	q.Set(stateParam(c), stateValue)
 	audURL.RawQuery = q.Encode()
 
-	if err := createTokenCookie(wc, w, r, issURL.String(), audURL.String(), stateValue); err != nil {
+	if err := createTokenCookie(c, w, r, issURL.String(), audURL.String(), stateValue); err != nil {
 		return err
 	}
 
@@ -102,8 +102,8 @@ func (wc *Config) Call(w http.ResponseWriter, r *http.Request, targetURL string)
 	return nil
 }
 
-func (wc *Config) Return(w http.ResponseWriter, r *http.Request) error {
-	iss, aud, err := validateAndIssAud(wc, r)
+func (c *Config) Return(w http.ResponseWriter, r *http.Request) error {
+	iss, aud, err := validateAndIssAud(c, r)
 	if err != nil {
 		return err
 	}
@@ -113,11 +113,11 @@ func (wc *Config) Return(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	stateValue := r.URL.Query().Get(stateParam(wc))
+	stateValue := r.URL.Query().Get(stateParam(c))
 
 	//Delete the Web Subroutine Cookie.
 	cookie := &http.Cookie{
-		Name:     cookieName(wc) + stateValue,
+		Name:     cookieNamePrefix(c) + stateValue,
 		Domain:   audURL.Hostname(),
 		Path:     r.URL.Path,
 		HttpOnly: true,
@@ -130,19 +130,19 @@ func (wc *Config) Return(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func (wc *Config) IsValid(r *http.Request) bool {
-	_, _, err := validateAndIssAud(wc, r)
+func (c *Config) IsValid(r *http.Request) bool {
+	_, _, err := validateAndIssAud(c, r)
 	return err != nil
 }
 
-func (wc *Config) Refresh(w http.ResponseWriter, r *http.Request) error {
-	iss, aud, err := validateAndIssAud(wc, r)
+func (c *Config) Refresh(w http.ResponseWriter, r *http.Request) error {
+	iss, aud, err := validateAndIssAud(c, r)
 	if err != nil {
 		return err
 	}
 
-	stateValue := r.URL.Query().Get(stateParam(wc))
-	if err := createTokenCookie(wc, w, r, iss, aud, stateValue); err != nil {
+	stateValue := r.URL.Query().Get(stateParam(c))
+	if err := createTokenCookie(c, w, r, iss, aud, stateValue); err != nil {
 		return err
 	}
 
@@ -151,20 +151,20 @@ func (wc *Config) Refresh(w http.ResponseWriter, r *http.Request) error {
 
 //header("Expires: Sat, 26 Jul 1997 05:00:00
 
-func validateAndIssAud(wc *Config, r *http.Request) (iss, aud string, err error) {
-	stateValue := r.URL.Query().Get(stateParam(wc))
+func validateAndIssAud(c *Config, r *http.Request) (iss, aud string, err error) {
+	stateValue := r.URL.Query().Get(stateParam(c))
 
-	c, err := r.Cookie(cookieName(wc) + stateValue)
-	if c == nil || err == http.ErrNoCookie {
+	cookie, err := r.Cookie(cookieNamePrefix(c) + stateValue)
+	if cookie == nil || err == http.ErrNoCookie {
 		return "", "", ErrTokenNotFound
 	}
 	if err != nil {
 		return "", "", err
 	}
-	v := c.Value
+	v := cookie.Value
 
 	//Recover the secret and handle errors.
-	s, err := secret(wc, r)
+	s, err := secret(c, r)
 	if err != nil {
 		return "", "", err
 	}
@@ -219,30 +219,30 @@ func absolutizeURL(u *url.URL, scheme, host string) *url.URL {
 	return au
 }
 
-func cookieName(wc *Config) string {
-	if wc.CookieName == "" {
-		return DefaultCookieName
+func cookieNamePrefix(c *Config) string {
+	if c.CookieName == "" {
+		return DefaultCookieNamePrefix
 	}
 
-	return wc.CookieName
+	return c.CookieName
 }
 
-func stateParam(wc *Config) string {
-	if wc.StateParam == "" {
+func stateParam(c *Config) string {
+	if c.StateParam == "" {
 		return DefaultStateParam
 	}
 
-	return wc.StateParam
+	return c.StateParam
 }
 
-func createTokenCookie(wc *Config, w http.ResponseWriter, r *http.Request, iss, aud, stateValue string) error {
+func createTokenCookie(c *Config, w http.ResponseWriter, r *http.Request, iss, aud, stateValue string) error {
 	//Create JWT Claims
 	claims := map[string]interface{}{
 		jwt.ClaimIssuer:   iss,
 		jwt.ClaimAudience: aud,
 	}
 
-	timeout := wc.TimeoutSeconds
+	timeout := c.TimeoutSeconds
 	if timeout == 0 {
 		timeout = DefaultTimeoutSeconds
 	}
@@ -252,7 +252,7 @@ func createTokenCookie(wc *Config, w http.ResponseWriter, r *http.Request, iss, 
 	}
 
 	//Recover the secret and handle errors.
-	s, err := secret(wc, r)
+	s, err := secret(c, r)
 	if err != nil {
 		return err
 	}
@@ -268,7 +268,7 @@ func createTokenCookie(wc *Config, w http.ResponseWriter, r *http.Request, iss, 
 	}
 
 	cookie := &http.Cookie{
-		Name:     cookieName(wc) + stateValue,
+		Name:     cookieNamePrefix(c) + stateValue,
 		Value:    t,
 		Domain:   audURL.Hostname(),
 		Path:     audURL.Path,
@@ -283,12 +283,12 @@ func createTokenCookie(wc *Config, w http.ResponseWriter, r *http.Request, iss, 
 	return nil
 }
 
-func secret(wc *Config, r *http.Request) ([]byte, error) {
+func secret(c *Config, r *http.Request) ([]byte, error) {
 	//Retrieve the Token secret (Custom or generated). Handle errors.
-	if wc.Secret == nil {
+	if c.Secret == nil {
 		return nil, ErrSecretError
 	}
-	secret := wc.Secret(r)
+	secret := c.Secret(r)
 	//It is part of the contract. Never return an empty secret. (Because it is no secret that way.)
 	if secret == nil || len(secret) == 0 {
 		return nil, ErrSecretError
